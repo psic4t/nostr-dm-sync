@@ -24,3 +24,10 @@ export {
 	resetSyncState,
 	resetMessageState
 } from './messages.svelte';
+
+export {
+	getConnectionState,
+	reconnectToRelay,
+	syncConnectionStatuses,
+	resetConnectionState
+} from './connections.svelte';

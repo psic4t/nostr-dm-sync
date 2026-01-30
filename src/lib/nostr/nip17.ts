@@ -1,12 +1,21 @@
 import type { NostrEvent } from './types';
 import type { Filter } from 'nostr-tools';
 import { KIND_RELAY_LIST_METADATA, KIND_GIFT_WRAP } from './types';
-import { queryRelays, queryRelay, closeRelays, supportsPtagFilter } from './relay';
+import { queryRelays, queryRelayWithStatus, closeRelays, supportsPtagFilter } from './relay';
+import type { QueryResult } from './relay';
 
 // Pagination constants
 const BATCH_SIZE = 500;
-const BATCH_TIMEOUT = 10000; // 10 seconds per batch
+const BATCH_TIMEOUT = 30000; // 30 seconds per batch (increased from 10s)
 const MAX_BATCHES = 20; // 10,000 events max
+
+// Fetch result with status information
+export interface FetchGiftWrapsResult {
+	events: NostrEvent[];
+	timedOut: boolean;
+	hadErrors: boolean;
+	errorMessage?: string;
+}
 
 /**
  * Default relays for discovering user metadata
@@ -66,12 +75,13 @@ export async function fetchMessagingRelays(pubkey: string): Promise<string[]> {
 /**
  * Fetch gift-wrapped messages (kind 1059) for a user from a specific relay
  * Uses pagination to fetch all messages in batches
+ * Returns result with status information (timeout, errors)
  */
 export async function fetchGiftWraps(
 	relayUrl: string,
 	pubkey: string,
 	onProgress?: (count: number) => void
-): Promise<NostrEvent[]> {
+): Promise<FetchGiftWrapsResult> {
 	console.log('[NIP-17] Fetching gift wraps from', relayUrl);
 
 	const supportsPFilter = supportsPtagFilter(relayUrl);
@@ -80,6 +90,9 @@ export async function fetchGiftWraps(
 	const allEvents = new Map<string, NostrEvent>();
 	let until: number | undefined = undefined;
 	let batchCount = 0;
+	let hadTimeout = false;
+	let hadErrors = false;
+	let lastError: string | undefined;
 
 	while (batchCount < MAX_BATCHES) {
 		batchCount++;
@@ -104,25 +117,41 @@ export async function fetchGiftWraps(
 			};
 		}
 
-		let events;
+		let result: QueryResult;
 		try {
-			events = await queryRelay(relayUrl, filter, BATCH_TIMEOUT);
+			result = await queryRelayWithStatus(relayUrl, filter, BATCH_TIMEOUT);
+			
+			if (result.timedOut) {
+				hadTimeout = true;
+				console.warn(`[NIP-17] Batch ${batchCount} timed out for ${relayUrl} (got ${result.events.length} events before timeout)`);
+			}
+			
+			if (result.closedReason && !result.closedReason.startsWith('auth-required')) {
+				hadErrors = true;
+				lastError = result.closedReason;
+				console.warn(`[NIP-17] Batch ${batchCount} closed with reason: ${result.closedReason}`);
+			}
 		} catch (err) {
 			console.warn(`[NIP-17] Batch ${batchCount} failed for ${relayUrl}, retrying...`);
+			hadErrors = true;
+			lastError = err instanceof Error ? err.message : 'Query failed';
+			
 			try {
-				events = await queryRelay(relayUrl, filter, BATCH_TIMEOUT);
+				result = await queryRelayWithStatus(relayUrl, filter, BATCH_TIMEOUT);
 			} catch {
 				console.warn(`[NIP-17] Retry failed for ${relayUrl}, returning partial results`);
 				break;
 			}
 		}
 
+		const events = result.events;
+
 		// Filter client-side if relay doesn't support #p filter
 		let matchingEvents = events;
 		if (supportsPFilter === false) {
-			matchingEvents = events.filter((e) => {
-				const pTags = (e.tags || []).filter((t) => t[0] === 'p' && typeof t[1] === 'string');
-				return pTags.some((ptag) => ptag[1] === pubkey);
+			matchingEvents = events.filter((e: { tags?: string[][] }) => {
+				const pTags = (e.tags || []).filter((t: string[]) => t[0] === 'p' && typeof t[1] === 'string');
+				return pTags.some((ptag: string[]) => ptag[1] === pubkey);
 			});
 			console.log(`[NIP-17] Client-side filter: ${events.length} -> ${matchingEvents.length} events`);
 		}
@@ -131,6 +160,10 @@ export async function fetchGiftWraps(
 			// If we got events but none matched, we've exhausted our events
 			if (events.length > 0 && supportsPFilter === false) {
 				console.log(`[NIP-17] Got ${events.length} events but none matched user, stopping`);
+			}
+			// If this was the first batch and it timed out with 0 events, that's significant
+			if (batchCount === 1 && result.timedOut && events.length === 0) {
+				console.warn(`[NIP-17] First batch timed out with 0 events for ${relayUrl} - relay may be slow or unresponsive`);
 			}
 			break;
 		}
@@ -146,7 +179,7 @@ export async function fetchGiftWraps(
 		if (events.length < BATCH_SIZE) break;
 
 		// Find oldest timestamp for next batch
-		const oldestTimestamp = Math.min(...events.map((e) => e.created_at));
+		const oldestTimestamp = Math.min(...events.map((e: { created_at: number }) => e.created_at));
 
 		// Safeguard: stop if until didn't change (prevents infinite loop)
 		if (until !== undefined && oldestTimestamp >= until) {
@@ -158,6 +191,13 @@ export async function fetchGiftWraps(
 		console.log(`[NIP-17] Batch ${batchCount}: got ${events.length} raw, ${matchingEvents.length} matched, total ${allEvents.size}, next until=${until}`);
 	}
 
-	console.log('[NIP-17] Got', allEvents.size, 'gift wraps from', relayUrl, `(${batchCount} batches)`);
-	return Array.from(allEvents.values());
+	console.log('[NIP-17] Got', allEvents.size, 'gift wraps from', relayUrl, `(${batchCount} batches)`, 
+		hadTimeout ? '[TIMED OUT]' : '', hadErrors ? '[HAD ERRORS]' : '');
+	
+	return {
+		events: Array.from(allEvents.values()),
+		timedOut: hadTimeout,
+		hadErrors,
+		errorMessage: lastError
+	};
 }

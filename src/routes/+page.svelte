@@ -12,7 +12,8 @@
 		resetRelayState,
 		getMessageState,
 		fetchAllMessages,
-		resetMessageState
+		resetMessageState,
+		resetConnectionState
 	} from '$lib/stores';
 
 	const user = getUserState();
@@ -64,6 +65,7 @@
 		// Reset state
 		resetMessageState();
 		resetRelayState();
+		resetConnectionState();
 		logout();
 	}
 

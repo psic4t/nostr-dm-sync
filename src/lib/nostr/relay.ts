@@ -8,15 +8,56 @@ export type { Event, Filter };
 // Auth status for a relay connection
 type RelayAuthStatus = 'unknown' | 'not_required' | 'required' | 'authenticated' | 'failed';
 
-// Extended relay state with auth tracking
+// Connection status for a relay
+export type RelayConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+// Query result with metadata
+export interface QueryResult {
+	events: Event[];
+	timedOut: boolean;
+	closedReason?: string;
+}
+
+// Extended relay state with auth and connection tracking
 interface RelayState {
-	relay: Relay;
+	relay: Relay | null;
 	authStatus: RelayAuthStatus;
 	authRetryCount: number;
+	connectionStatus: RelayConnectionStatus;
+	connectionError: string | null;
+	closingIntentionally: boolean; // Flag to prevent onclose from firing during intentional reconnect
+}
+
+// Listeners for connection status changes
+type ConnectionStatusListener = (url: string, status: RelayConnectionStatus, error: string | null) => void;
+const connectionStatusListeners = new Set<ConnectionStatusListener>();
+
+/**
+ * Subscribe to connection status changes
+ */
+export function onConnectionStatusChange(listener: ConnectionStatusListener): () => void {
+	connectionStatusListeners.add(listener);
+	return () => connectionStatusListeners.delete(listener);
+}
+
+/**
+ * Notify all listeners of a connection status change
+ */
+function notifyConnectionStatusChange(url: string, status: RelayConnectionStatus, error: string | null): void {
+	for (const listener of connectionStatusListeners) {
+		try {
+			listener(url, status, error);
+		} catch (e) {
+			console.error('[Relay] Connection status listener error:', e);
+		}
+	}
 }
 
 // Configuration
 const MAX_AUTH_RETRIES = 3;
+const CONNECTION_TIMEOUT = 15000; // 15 seconds (default is 4.4s)
+const AUTH_WAIT_TIMEOUT = 3000; // Wait up to 3 seconds for AUTH challenge
+const POST_CONNECT_MONITOR_DELAY = 2000; // Monitor for disconnects within 2 seconds of connect
 
 // Relay connection cache with auth state
 const relayStates = new Map<string, RelayState>();
@@ -220,7 +261,7 @@ export function setSigner(s: Signer | null): void {
 
 	// Update onauth handler for all existing connections
 	for (const [url, state] of relayStates) {
-		if (state.relay.connected) {
+		if (state.relay && state.relay.connected) {
 			state.relay.onauth = s ? createAuthHandler(url) : undefined;
 			console.log(`[AUTH] Updated onauth handler for ${url} (signer: ${s ? 'set' : 'cleared'})`);
 
@@ -309,50 +350,181 @@ async function authenticateRelay(url: string): Promise<boolean> {
 async function getRelay(url: string): Promise<Relay> {
 	let state = relayStates.get(url);
 
-	// Return existing connected relay
+	// Return existing connected relay (must have valid relay object)
 	if (state?.relay && state.relay.connected) {
 		return state.relay;
 	}
 
-	// Create new relay connection using static connect method
-	console.log(`[Relay] Connecting to ${url}`);
-	const relay = await Relay.connect(url);
-	console.log(`[Relay] Connected to ${url}`);
+	// If there's a stale state with null/disconnected relay, clean it up
+	if (state && (!state.relay || !state.relay.connected)) {
+		console.log(`[Relay] Cleaning up stale state for ${url}`);
+		relayStates.delete(url);
+		state = undefined;
+	}
 
-	// Set up AUTH handler
+	// Notify connecting status
+	notifyConnectionStatusChange(url, 'connecting', null);
+
+	// Check if this is a known AUTH relay
+	const isAuthRelay = knownAuthRelays.has(url);
+	const hasSigner = !!signer;
+
+	// Create new relay connection using static connect method
+	console.log(`[Relay] Connecting to ${url}${isAuthRelay ? ' (AUTH relay)' : ''}`);
+	const relay = await Relay.connect(url);
+	
+	// Set longer connection timeout to handle slow relays and AUTH
+	relay.connectionTimeout = CONNECTION_TIMEOUT;
+	
+	console.log(`[Relay] WebSocket connected to ${url}`);
+
+	// Set up AUTH handler BEFORE anything else
 	const authHandler = createAuthHandler(url);
 	if (authHandler) {
 		relay.onauth = authHandler;
 		console.log(`[AUTH] Registered onauth handler for ${url}`);
+	} else if (isAuthRelay) {
+		console.warn(`[AUTH] No signer available for AUTH relay ${url} - authentication will fail`);
 	}
 
 	// Determine initial auth status
-	const initialAuthStatus: RelayAuthStatus = knownAuthRelays.has(url) ? 'required' : 'unknown';
+	const initialAuthStatus: RelayAuthStatus = isAuthRelay ? 'required' : 'unknown';
 
-	// Cache the relay state
-	state = { relay, authStatus: initialAuthStatus, authRetryCount: 0 };
+	// Cache the relay state - but mark as 'connecting' until AUTH completes for AUTH relays
+	state = {
+		relay,
+		authStatus: initialAuthStatus,
+		authRetryCount: 0,
+		connectionStatus: (isAuthRelay && hasSigner) ? 'connecting' : 'connected',
+		connectionError: null,
+		closingIntentionally: false
+	};
 	relayStates.set(url, state);
 
-	// For known AUTH relays, log that we'll handle auth reactively
-	// Note: We don't call relay.auth() proactively because the relay may not have
-	// sent the AUTH challenge yet. Instead, onauth callback handles challenges
-	// automatically, and we handle auth-required: responses in operations.
-	if (initialAuthStatus === 'required' && signer) {
-		console.log(`[AUTH] Relay ${url} is known to require auth - onauth handler ready`);
+	// Set up onclose handler to track disconnections
+	relay.onclose = () => {
+		console.log(`[Relay] Connection closed for ${url}`);
+		const currentState = relayStates.get(url);
+		// Only notify if this wasn't an intentional close (e.g., during reconnect)
+		if (currentState && !currentState.closingIntentionally) {
+			const wasConnecting = currentState.connectionStatus === 'connecting';
+			currentState.connectionStatus = 'error';
+			currentState.connectionError = wasConnecting 
+				? 'Connection failed during authentication' 
+				: 'Connection closed unexpectedly';
+			currentState.relay = null; // Clear the relay reference
+			notifyConnectionStatusChange(url, 'error', currentState.connectionError);
+		}
+	};
+
+	// For known AUTH relays with a signer, wait for AUTH to complete
+	if (isAuthRelay && hasSigner) {
+		console.log(`[AUTH] Waiting for AUTH challenge from ${url}...`);
+		
+		try {
+			// Wait for AUTH challenge to arrive and complete authentication
+			const authSuccess = await waitForAuth(relay, url, AUTH_WAIT_TIMEOUT);
+			
+			if (authSuccess) {
+				state.authStatus = 'authenticated';
+				state.connectionStatus = 'connected';
+				console.log(`[AUTH] Successfully authenticated with ${url}`);
+				notifyConnectionStatusChange(url, 'connected', null);
+			} else {
+				// AUTH didn't complete in time, but connection is still open
+				// The relay might not require AUTH for all operations, or challenge will come later
+				state.connectionStatus = 'connected';
+				console.log(`[AUTH] AUTH not completed for ${url}, but connection is open - proceeding`);
+				notifyConnectionStatusChange(url, 'connected', null);
+			}
+		} catch (err) {
+			const errorMsg = err instanceof Error ? err.message : 'Authentication failed';
+			console.error(`[AUTH] AUTH failed for ${url}:`, errorMsg);
+			state.connectionStatus = 'error';
+			state.connectionError = `Authentication failed: ${errorMsg}`;
+			notifyConnectionStatusChange(url, 'error', state.connectionError);
+			throw new Error(state.connectionError);
+		}
+	} else {
+		// Non-AUTH relay or no signer - notify connected immediately
+		notifyConnectionStatusChange(url, 'connected', null);
+		
+		// Set up post-connect monitoring to catch early disconnects
+		setupPostConnectMonitor(url, relay);
 	}
 
 	return relay;
 }
 
 /**
- * Query events from a single relay with AUTH support
- * Handles auth-required: close reason by authenticating and retrying
+ * Wait for AUTH challenge and complete authentication
+ * Returns true if AUTH completed successfully, false if timed out (but connection still open)
+ * Throws if AUTH failed
  */
-export async function queryRelay(
+async function waitForAuth(relay: Relay, url: string, timeoutMs: number): Promise<boolean> {
+	const startTime = Date.now();
+	
+	// Poll for challenge arrival
+	while (Date.now() - startTime < timeoutMs) {
+		// Check if relay is still connected
+		if (!relay.connected) {
+			throw new Error('Connection closed while waiting for AUTH');
+		}
+		
+		// Try to authenticate (will fail with "no challenge" if not received yet)
+		try {
+			const authHandler = createAuthHandler(url);
+			if (!authHandler) {
+				throw new Error('No signer available');
+			}
+			
+			await relay.auth(authHandler);
+			return true; // AUTH completed successfully
+		} catch (e) {
+			const errMsg = e instanceof Error ? e.message : String(e);
+			
+			if (errMsg.includes('no challenge')) {
+				// Challenge not received yet, wait and retry
+				await new Promise(resolve => setTimeout(resolve, 200));
+				continue;
+			}
+			
+			// Real AUTH error
+			throw e;
+		}
+	}
+	
+	// Timed out waiting for challenge, but connection is still open
+	return false;
+}
+
+/**
+ * Monitor for early disconnects after connection
+ * This catches cases where the relay closes shortly after opening (e.g., AUTH timeout on relay side)
+ */
+function setupPostConnectMonitor(url: string, relay: Relay): void {
+	setTimeout(() => {
+		const state = relayStates.get(url);
+		if (state && state.relay === relay && !relay.connected && state.connectionStatus === 'connected') {
+			console.warn(`[Relay] Connection to ${url} lost shortly after connecting`);
+			state.connectionStatus = 'error';
+			state.connectionError = 'Connection lost shortly after connecting';
+			state.relay = null;
+			notifyConnectionStatusChange(url, 'error', state.connectionError);
+		}
+	}, POST_CONNECT_MONITOR_DELAY);
+}
+
+/**
+ * Query events from a single relay with AUTH support and status tracking
+ * Handles auth-required: close reason by authenticating and retrying
+ * Returns QueryResult with events, timeout status, and close reason
+ */
+export async function queryRelayWithStatus(
 	url: string,
 	filter: Filter,
 	timeoutMs: number = 10000
-): Promise<Event[]> {
+): Promise<QueryResult> {
 	try {
 		const relay = await getRelay(url);
 		const state = relayStates.get(url)!;
@@ -361,11 +533,13 @@ export async function queryRelay(
 			const events: Event[] = [];
 			let resolved = false;
 			let authRetried = false;
+			let timedOut = false;
+			let closedReason: string | undefined;
 
 			const done = () => {
 				if (!resolved) {
 					resolved = true;
-					resolve(events);
+					resolve({ events, timedOut, closedReason });
 				}
 			};
 
@@ -394,10 +568,12 @@ export async function queryRelay(
 					onclose(reason) {
 						console.log(`[Relay] Subscription closed for ${url}, reason: "${reason}"`);
 
-						// Ignore "closed by caller" - we closed it ourselves
+						// Ignore "closed by caller" - we closed it ourselves (could be timeout or manual)
 						if (reason === 'closed by caller') {
 							return;
 						}
+
+						closedReason = reason;
 
 						// Check if auth required
 						if (reason.startsWith('auth-required:')) {
@@ -422,14 +598,17 @@ export async function queryRelay(
 								.then((success) => {
 									if (success) {
 										console.log(`[AUTH] Auth completed for ${url}, retrying subscription`);
+										closedReason = undefined; // Reset close reason after successful auth
 										doSubscribe(); // Retry
 									} else {
 										console.warn(`[AUTH] Auth failed for ${url}, giving up`);
+										closedReason = 'auth-failed';
 										done();
 									}
 								})
 								.catch((err: Error) => {
 									console.warn(`[AUTH] Auth error for ${url}:`, err);
+									closedReason = `auth-error: ${err.message}`;
 									done();
 								});
 						} else if (!closedForAuth) {
@@ -447,15 +626,52 @@ export async function queryRelay(
 			// Timeout fallback
 			setTimeout(() => {
 				if (!resolved) {
+					timedOut = true;
+					console.warn(`[Relay] Query to ${url} timed out after ${timeoutMs}ms (got ${events.length} events)`);
 					sub.close();
 					done();
 				}
 			}, timeoutMs);
 		});
 	} catch (err) {
+		const errorMsg = err instanceof Error ? err.message : 'Connection failed';
 		console.warn(`[Relay] Query to ${url} failed:`, err);
-		return [];
+		
+		// Update connection status to error
+		const state = relayStates.get(url);
+		if (state) {
+			state.connectionStatus = 'error';
+			state.connectionError = errorMsg;
+			state.relay = null; // Clear invalid relay
+		} else {
+			// Create error state for relay we couldn't connect to
+			relayStates.set(url, {
+				relay: null,
+				authStatus: 'unknown',
+				authRetryCount: 0,
+				connectionStatus: 'error',
+				connectionError: errorMsg,
+				closingIntentionally: false
+			});
+		}
+		notifyConnectionStatusChange(url, 'error', errorMsg);
+		
+		return { events: [], timedOut: false, closedReason: errorMsg };
 	}
+}
+
+/**
+ * Query events from a single relay with AUTH support
+ * Handles auth-required: close reason by authenticating and retrying
+ * @deprecated Use queryRelayWithStatus for better error handling
+ */
+export async function queryRelay(
+	url: string,
+	filter: Filter,
+	timeoutMs: number = 10000
+): Promise<Event[]> {
+	const result = await queryRelayWithStatus(url, filter, timeoutMs);
+	return result.events;
 }
 
 /**
@@ -668,7 +884,10 @@ export function closeRelays(urls: string[]): void {
 	for (const url of urls) {
 		const state = relayStates.get(url);
 		if (state) {
-			state.relay.close();
+			state.closingIntentionally = true; // Prevent onclose from firing notifications
+			if (state.relay) {
+				state.relay.close();
+			}
 			relayStates.delete(url);
 		}
 	}
@@ -679,7 +898,10 @@ export function closeRelays(urls: string[]): void {
  */
 export function destroyPool(): void {
 	for (const [, state] of relayStates) {
-		state.relay.close();
+		state.closingIntentionally = true; // Prevent onclose from firing notifications
+		if (state.relay) {
+			state.relay.close();
+		}
 	}
 	relayStates.clear();
 }
@@ -717,4 +939,100 @@ export function resetAuthRetry(url: string): void {
  */
 export function getMaxAuthRetries(): number {
 	return MAX_AUTH_RETRIES;
+}
+
+/**
+ * Get connection status for a relay
+ */
+export function getRelayConnectionStatus(url: string): RelayConnectionStatus | null {
+	const state = relayStates.get(url);
+	if (!state) return null;
+	// Also check the actual connection state from nostr-tools
+	if (state.relay && !state.relay.connected && state.connectionStatus === 'connected') {
+		state.connectionStatus = 'disconnected';
+	}
+	return state.connectionStatus;
+}
+
+/**
+ * Get connection error for a relay
+ */
+export function getRelayConnectionError(url: string): string | null {
+	return relayStates.get(url)?.connectionError ?? null;
+}
+
+/**
+ * Manually reconnect to a relay
+ * Returns true if reconnection succeeded, false otherwise
+ */
+export async function reconnectRelay(url: string): Promise<boolean> {
+	console.log(`[Relay] Manual reconnect requested for ${url}`);
+	
+	// Close existing connection if any - mark as intentional to prevent race condition
+	const existingState = relayStates.get(url);
+	if (existingState) {
+		existingState.closingIntentionally = true; // Prevent onclose from firing
+		try {
+			if (existingState.relay) {
+				existingState.relay.close();
+			}
+		} catch {
+			// Ignore close errors
+		}
+		// Delete state AFTER marking intentional and closing
+		relayStates.delete(url);
+	}
+
+	// Reset auth retry count for this relay to give it a fresh start
+	// (The state was deleted, but we also need to ensure the new state starts fresh)
+
+	// Note: getRelay() will notify 'connecting' status, so we don't need to here
+	// This prevents duplicate notifications
+
+	try {
+		const relay = await getRelay(url);
+		
+		// Double-check connection is actually working
+		if (!relay.connected) {
+			throw new Error('Connection established but relay reports disconnected');
+		}
+		
+		return true;
+	} catch (err) {
+		const errorMsg = err instanceof Error ? err.message : 'Connection failed';
+		console.error(`[Relay] Reconnect failed for ${url}:`, errorMsg);
+		
+		// Check if getRelay already set error state
+		const currentState = relayStates.get(url);
+		if (!currentState || currentState.connectionStatus !== 'error') {
+			// Store error state
+			relayStates.set(url, {
+				relay: null,
+				authStatus: 'unknown',
+				authRetryCount: 0,
+				connectionStatus: 'error',
+				connectionError: errorMsg,
+				closingIntentionally: false
+			});
+			
+			notifyConnectionStatusChange(url, 'error', errorMsg);
+		}
+		return false;
+	}
+}
+
+/**
+ * Get all relay connection statuses (for UI)
+ */
+export function getAllRelayConnectionStatuses(): Map<string, { status: RelayConnectionStatus; error: string | null }> {
+	const result = new Map<string, { status: RelayConnectionStatus; error: string | null }>();
+	for (const [url, state] of relayStates) {
+		// Check actual connection state
+		let status = state.connectionStatus;
+		if (state.relay && !state.relay.connected && status === 'connected') {
+			status = 'disconnected';
+		}
+		result.set(url, { status, error: state.connectionError });
+	}
+	return result;
 }

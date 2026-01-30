@@ -1,12 +1,23 @@
 import { fetchGiftWraps, publishToRelays, getGiftwrapPQueryCap, detectPtagFilterCapability } from '$lib/nostr';
 import type { NostrEvent } from '$lib/nostr';
 
+// Fetch status for a relay
+export type FetchStatus = 'idle' | 'fetching' | 'success' | 'timeout' | 'error' | 'partial';
+
+export interface RelayFetchStatus {
+	status: FetchStatus;
+	messageCount: number;
+	timedOut: boolean;
+	errorMessage?: string;
+}
+
 // Message state using Svelte 5 runes
 let messagesByRelay = $state<Map<string, Set<string>>>(new Map()); // relay URL -> event IDs
 let allMessages = $state<Map<string, NostrEvent>>(new Map()); // event ID -> event
 let fetchingRelays = $state<Set<string>>(new Set());
 let fetchErrors = $state<Map<string, string>>(new Map());
 let fetchProgress = $state<Map<string, number>>(new Map()); // relay URL -> message count during fetch
+let fetchStatuses = $state<Map<string, RelayFetchStatus>>(new Map()); // relay URL -> fetch status details
 
 // Sync state
 let syncInProgress = $state(false);
@@ -91,16 +102,26 @@ export async function fetchMessagesFromRelay(relayUrl: string, pubkey: string): 
 	// Mark as fetching
 	fetchingRelays = new Set([...fetchingRelays, relayUrl]);
 	fetchErrors.delete(relayUrl);
+	
+	// Initialize fetch status
+	fetchStatuses.set(relayUrl, {
+		status: 'fetching',
+		messageCount: 0,
+		timedOut: false
+	});
+	fetchStatuses = new Map(fetchStatuses);
 
 	try {
 		console.log('[Messages] Fetching from', relayUrl);
 		fetchProgress.set(relayUrl, 0);
 		fetchProgress = new Map(fetchProgress);
 
-		const events = await fetchGiftWraps(relayUrl, pubkey, (count) => {
+		const result = await fetchGiftWraps(relayUrl, pubkey, (count) => {
 			fetchProgress.set(relayUrl, count);
 			fetchProgress = new Map(fetchProgress);
 		});
+
+		const { events, timedOut, hadErrors, errorMessage } = result;
 
 		// Store events
 		const relayMessageIds = new Set<string>();
@@ -114,16 +135,56 @@ export async function fetchMessagesFromRelay(relayUrl: string, pubkey: string): 
 		allMessages = new Map(allMessages);
 		messagesByRelay = new Map(messagesByRelay);
 
+		// Determine final fetch status
+		let finalStatus: FetchStatus = 'success';
+		if (timedOut && events.length === 0) {
+			finalStatus = 'timeout';
+		} else if (timedOut && events.length > 0) {
+			finalStatus = 'partial'; // Got some events but timed out
+		} else if (hadErrors && events.length === 0) {
+			finalStatus = 'error';
+		} else if (hadErrors) {
+			finalStatus = 'partial';
+		}
+
+		// Update fetch status
+		fetchStatuses.set(relayUrl, {
+			status: finalStatus,
+			messageCount: events.length,
+			timedOut,
+			errorMessage
+		});
+		fetchStatuses = new Map(fetchStatuses);
+
+		// Set error message for UI if needed
+		if (finalStatus === 'timeout') {
+			fetchErrors.set(relayUrl, 'Query timed out - relay may be slow or unresponsive');
+			fetchErrors = new Map(fetchErrors);
+		} else if (finalStatus === 'error' && errorMessage) {
+			fetchErrors.set(relayUrl, errorMessage);
+			fetchErrors = new Map(fetchErrors);
+		}
+
 		const cap = getGiftwrapPQueryCap(relayUrl);
 		if (events.length === 0 && cap === false) {
 			console.log('[Messages] Relay appears unqueryable for giftwrap #p filter:', relayUrl);
 		}
-		console.log('[Messages] Got', events.length, 'messages from', relayUrl);
+		console.log('[Messages] Got', events.length, 'messages from', relayUrl, 
+			timedOut ? '[TIMED OUT]' : '', hadErrors ? '[HAD ERRORS]' : '');
 	} catch (err) {
 		console.error('[Messages] Fetch error for', relayUrl, err);
 		const errorMsg = err instanceof Error ? err.message : 'Failed to fetch messages';
 		fetchErrors.set(relayUrl, errorMsg);
 		fetchErrors = new Map(fetchErrors);
+		
+		// Update fetch status to error
+		fetchStatuses.set(relayUrl, {
+			status: 'error',
+			messageCount: 0,
+			timedOut: false,
+			errorMessage: errorMsg
+		});
+		fetchStatuses = new Map(fetchStatuses);
 	} finally {
 		// Remove from fetching set and clear progress
 		fetchingRelays.delete(relayUrl);
@@ -267,6 +328,7 @@ export function resetMessageState(): void {
 	fetchingRelays = new Set();
 	fetchErrors = new Map();
 	fetchProgress = new Map();
+	fetchStatuses = new Map();
 	resetSyncState();
 }
 
@@ -280,6 +342,7 @@ export function getMessageState() {
 		get fetchingRelays() { return fetchingRelays; },
 		get fetchErrors() { return fetchErrors; },
 		get fetchProgress() { return fetchProgress; },
+		get fetchStatuses() { return fetchStatuses; },
 		get syncInProgress() { return syncInProgress; },
 		get syncSourceRelay() { return syncSourceRelay; },
 		get syncProgress() { return syncProgress; },
@@ -304,6 +367,9 @@ export function getMessageState() {
 		},
 		getFetchProgress(relayUrl: string) {
 			return fetchProgress.get(relayUrl) ?? 0;
+		},
+		getFetchStatus(relayUrl: string): RelayFetchStatus | null {
+			return fetchStatuses.get(relayUrl) ?? null;
 		}
 	};
 }

@@ -33,8 +33,15 @@ export {
 	closeRelays,
 	destroyPool,
 	getGiftwrapPQueryCap,
-	detectPtagFilterCapability
+	detectPtagFilterCapability,
+	getRelayConnectionStatus,
+	getRelayConnectionError,
+	reconnectRelay,
+	getAllRelayConnectionStatuses,
+	onConnectionStatusChange
 } from './relay';
+
+export type { RelayConnectionStatus } from './relay';
 
 // NIP-17
 export {
@@ -42,3 +49,6 @@ export {
 	fetchMessagingRelays,
 	fetchGiftWraps
 } from './nip17';
+
+export type { FetchGiftWrapsResult } from './nip17';
+export type { QueryResult } from './relay';
